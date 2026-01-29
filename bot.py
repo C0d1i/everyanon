@@ -18,7 +18,7 @@ PORT = int(os.getenv("PORT", "8000"))
 WEBHOOK_HOST = os.getenv("RENDER_EXTERNAL_HOSTNAME")
 WEBHOOK_URL = f"https://{WEBHOOK_HOST}/{BOT_TOKEN}"
 
-# === Установка webhook ===
+# === Webhook setup ===
 def set_webhook():
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/setWebhook"
     try:
@@ -26,17 +26,16 @@ def set_webhook():
         if response.json().get("ok"):
             print(f"✅ Webhook установлен: {WEBHOOK_URL}")
         else:
-            print(f"❌ Ошибка webhook: {response.json()}")
+            print(f"❌ Ошибка: {response.json()}")
     except Exception as e:
         print(f"⚠️ Исключение: {e}")
 
-# === Автообновление webhook каждые 12 минут ===
 def webhook_refresh_loop():
     while True:
         set_webhook()
         time.sleep(720)  # 12 минут
 
-# === Команда /start ===
+# === Генерация или получение существующей ссылки ===
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     args = context.args
@@ -52,26 +51,77 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Ссылка недействительна.")
         return
 
-    # Даём владельцу ссылку
+    # Получаем или создаём ссылку
     code_to_user = context.bot_data.setdefault("code_to_user", {})
     user_to_code = context.bot_data.setdefault("user_to_code", {})
     
-    # Генерируем новый код (даже если был)
-    code = secrets.token_urlsafe(8)
-    user_to_code[user_id] = code
-    code_to_user[code] = user_id
+    if user_id not in user_to_code:
+        code = secrets.token_urlsafe(8)
+        user_to_code[user_id] = code
+        code_to_user[code] = user_id
+        is_new = True
+    else:
+        code = user_to_code[user_id]
+        is_new = False
 
     bot_username = context.bot.username or "AnonGlobalBot"
     link = f"https://t.me/{bot_username}?start={code}"
 
-    keyboard = [[InlineKeyboardButton("🔗 Отправить ссылку", url=f"https://t.me/share/url?url={link}")]]
+    keyboard = [
+        [InlineKeyboardButton("🔗 Отправить ссылку", url=f"https://t.me/share/url?url={link}")],
+        [InlineKeyboardButton("🔄 Сбросить ссылку", callback_data="reset_link")]
+    ]
     reply_markup = InlineKeyboardMarkup(keyboard)
 
-    await update.message.reply_text(
-        f"📬 Ваша новая личная ссылка:\n{link}\n\n"
-        "Старая ссылка больше не работает.",
-        reply_markup=reply_markup
-    )
+    if is_new:
+        msg = f"📬 Ваша личная ссылка:\n{link}\n\nОна будет работать, пока вы не сбросите её."
+    else:
+        msg = f"Ваша текущая ссылка:\n{link}\n\nОна уже активна."
+
+    await update.message.reply_text(msg, reply_markup=reply_markup)
+
+# === Сброс ссылки по кнопке или команде ===
+async def reset_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query:
+        await query.answer()
+        user_id = query.from_user.id
+    else:
+        user_id = update.effective_user.id
+
+    code_to_user = context.bot_data.get("code_to_user", {})
+    user_to_code = context.bot_data.get("user_to_code", {})
+
+    # Удаляем старую ссылку
+    if user_id in user_to_code:
+        old_code = user_to_code[user_id]
+        code_to_user.pop(old_code, None)
+        user_to_code.pop(user_id, None)
+
+    # Создаём новую
+    new_code = secrets.token_urlsafe(8)
+    user_to_code[user_id] = new_code
+    code_to_user[new_code] = user_id
+
+    bot_username = context.bot.username or "AnonGlobalBot"
+    link = f"https://t.me/{bot_username}?start={new_code}"
+
+    keyboard = [
+        [InlineKeyboardButton("🔗 Отправить ссылку", url=f"https://t.me/share/url?url={link}")],
+        [InlineKeyboardButton("🔄 Сбросить ссылку", callback_data="reset_link")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    if query:
+        await query.edit_message_text(
+            f"✅ Ссылка сброшена!\nНовая ссылка:\n{link}",
+            reply_markup=reply_markup
+        )
+    else:
+        await update.message.reply_text(
+            f"✅ Ссылка сброшена!\nНовая ссылка:\n{link}",
+            reply_markup=reply_markup
+        )
 
 # === Обработка сообщений ===
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -106,7 +156,9 @@ def main():
 
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("newlink", reset_link))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_handler(CallbackQueryHandler(reset_link, pattern="^reset_link$"))
 
     app.run_webhook(
         listen="0.0.0.0",
@@ -116,4 +168,5 @@ def main():
     )
 
 if __name__ == "__main__":
+    from telegram.ext import CallbackQueryHandler
     main()
