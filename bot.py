@@ -1,4 +1,5 @@
 import os
+import json
 import requests
 import secrets
 import threading
@@ -9,7 +10,8 @@ from telegram.ext import (
     CommandHandler,
     MessageHandler,
     ContextTypes,
-    filters
+    filters,
+    CallbackQueryHandler
 )
 
 # === Настройки ===
@@ -17,6 +19,22 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 PORT = int(os.getenv("PORT", "8000"))
 WEBHOOK_HOST = os.getenv("RENDER_EXTERNAL_HOSTNAME")
 WEBHOOK_URL = f"https://{WEBHOOK_HOST}/{BOT_TOKEN}"
+STORAGE_FILE = "storage.json"
+
+# === Загрузка данных из файла ===
+def load_storage():
+    if os.path.exists(STORAGE_FILE):
+        try:
+            with open(STORAGE_FILE, "r") as f:
+                return json.load(f)
+        except:
+            pass
+    return {"user_to_code": {}, "code_to_user": {}}
+
+# === Сохранение данных в файл ===
+def save_storage(data):
+    with open(STORAGE_FILE, "w") as f:
+        json.dump(data, f)
 
 # === Webhook setup ===
 def set_webhook():
@@ -33,35 +51,32 @@ def set_webhook():
 def webhook_refresh_loop():
     while True:
         set_webhook()
-        time.sleep(720)  # 12 минут
+        time.sleep(720)
 
-# === Генерация или получение существующей ссылки ===
+# === Основные функции ===
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
+    user_id = str(update.effective_user.id)  # JSON keys must be strings
     args = context.args
 
-    # Если есть аргумент — это отправитель
     if args:
         code = args[0]
-        code_to_user = context.bot_data.get("code_to_user", {})
-        if code in code_to_user:
+        storage = load_storage()
+        if code in storage["code_to_user"]:
             context.user_data["target_code"] = code
             await update.message.reply_text("🤫 Напишите анонимное сообщение:")
         else:
             await update.message.reply_text("❌ Ссылка недействительна.")
         return
 
-    # Получаем или создаём ссылку
-    code_to_user = context.bot_data.setdefault("code_to_user", {})
-    user_to_code = context.bot_data.setdefault("user_to_code", {})
-    
-    if user_id not in user_to_code:
+    storage = load_storage()
+    if user_id not in storage["user_to_code"]:
         code = secrets.token_urlsafe(8)
-        user_to_code[user_id] = code
-        code_to_user[code] = user_id
+        storage["user_to_code"][user_id] = code
+        storage["code_to_user"][code] = user_id
+        save_storage(storage)
         is_new = True
     else:
-        code = user_to_code[user_id]
+        code = storage["user_to_code"][user_id]
         is_new = False
 
     bot_username = context.bot.username or "AnonGlobalBot"
@@ -80,28 +95,25 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(msg, reply_markup=reply_markup)
 
-# === Сброс ссылки по кнопке или команде ===
 async def reset_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     if query:
         await query.answer()
-        user_id = query.from_user.id
+        user_id = str(query.from_user.id)
     else:
-        user_id = update.effective_user.id
+        user_id = str(update.effective_user.id)
 
-    code_to_user = context.bot_data.get("code_to_user", {})
-    user_to_code = context.bot_data.get("user_to_code", {})
+    storage = load_storage()
 
-    # Удаляем старую ссылку
-    if user_id in user_to_code:
-        old_code = user_to_code[user_id]
-        code_to_user.pop(old_code, None)
-        user_to_code.pop(user_id, None)
+    if user_id in storage["user_to_code"]:
+        old_code = storage["user_to_code"][user_id]
+        storage["code_to_user"].pop(old_code, None)
+        storage["user_to_code"].pop(user_id, None)
 
-    # Создаём новую
     new_code = secrets.token_urlsafe(8)
-    user_to_code[user_id] = new_code
-    code_to_user[new_code] = user_id
+    storage["user_to_code"][user_id] = new_code
+    storage["code_to_user"][new_code] = user_id
+    save_storage(storage)
 
     bot_username = context.bot.username or "AnonGlobalBot"
     link = f"https://t.me/{bot_username}?start={new_code}"
@@ -123,7 +135,6 @@ async def reset_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=reply_markup
         )
 
-# === Обработка сообщений ===
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     target_code = context.user_data.get("target_code")
     if not target_code:
@@ -134,21 +145,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not text or text.startswith("/"):
         return
 
-    owner_id = context.bot_data.get("code_to_user", {}).get(target_code)
+    storage = load_storage()
+    owner_id = storage["code_to_user"].get(target_code)
     if not owner_id:
         await update.message.reply_text("❌ Ссылка устарела.")
         return
 
     try:
         await context.bot.send_message(
-            chat_id=owner_id,
+            chat_id=int(owner_id),
             text=f"📨 Анонимное сообщение:\n\n{text}"
         )
         await update.message.reply_text("✅ Сообщение отправлено!")
     except Exception:
         await update.message.reply_text("❌ Не удалось доставить.")
 
-# === Запуск ===
 def main():
     set_webhook()
     refresh_thread = threading.Thread(target=webhook_refresh_loop, daemon=True)
@@ -168,5 +179,4 @@ def main():
     )
 
 if __name__ == "__main__":
-    from telegram.ext import CallbackQueryHandler
     main()
